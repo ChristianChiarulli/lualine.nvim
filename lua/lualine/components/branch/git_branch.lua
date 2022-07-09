@@ -50,8 +50,38 @@ local function update_branch()
       end)
     )
   else
-    -- set to '' when git dir was not found
-    current_git_branch = ''
+    local ui_filetypes = {
+      'help',
+      'packer',
+      'neogitstatus',
+      'NvimTree',
+      'Trouble',
+      'lir',
+      'Outline',
+      'spectre_panel',
+      'toggleterm',
+      'DressingSelect',
+      '',
+    }
+
+    local buf_ft = vim.bo.filetype
+    M.cached_branch = current_git_branch
+
+    local function contains(t, value)
+      for _, v in pairs(t) do
+        if v == value then
+          return true
+        end
+      end
+      return false
+    end
+
+    if contains(ui_filetypes, buf_ft) then
+      branch_cache[vim.api.nvim_get_current_buf()] = M.cached_branch
+    else
+      -- set to '' when git dir was not found
+      current_git_branch = ''
+    end
   end
   branch_cache[vim.api.nvim_get_current_buf()] = current_git_branch
 end
@@ -129,3 +159,4 @@ function M.get_branch(bufnr)
 end
 
 return M
+
