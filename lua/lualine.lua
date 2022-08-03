@@ -17,7 +17,13 @@ local timers = {
   stl_timer = vim.loop.new_timer(),
   tal_timer = vim.loop.new_timer(),
   wb_timer = vim.loop.new_timer(),
+  halt_stl_refresh = false, -- mutex ?
+  halt_tal_refresh = false,
+  halt_wb_refresh = false,
 }
+
+local last_focus = {}
+local refresh_real_curwin
 
 -- The events on which lualine redraws itself
 local default_refresh_events = 'WinEnter,BufEnter,SessionLoadPost,FileChangedShellPost,VimResized,Filetype'
@@ -187,7 +193,7 @@ end)
 --- check if any extension matches the filetype and return proper sections
 ---@param current_ft string : filetype name of current file
 ---@param is_focused boolean : whether being evaluated for focused window or not
----@return table : (section_table) section config where components are replaced with
+---@return table|nil : (section_table) section config where components are replaced with
 ---      component objects
 -- TODO: change this so it uses a hash table instead of iteration over list
 --       to improve redraws. Add buftype / bufname for extensions
@@ -195,7 +201,11 @@ end)
 local function get_extension_sections(current_ft, is_focused, sec_name)
   for _, extension in ipairs(config.extensions) do
     if vim.tbl_contains(extension.filetypes, current_ft) then
-      return extension[(is_focused and '' or 'inactive_') .. sec_name]
+      if is_focused then
+        return extension[sec_name]
+      else
+        return extension['inactive_' .. sec_name] or extension[sec_name]
+      end
     end
   end
   return nil
@@ -267,7 +277,9 @@ end
 local function status_dispatch(sec_name)
   return function(focused)
     local retval
-    local current_ft = vim.bo.filetype
+    local current_ft = refresh_real_curwin
+        and vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(refresh_real_curwin), 'filetype')
+      or vim.bo.filetype
     local is_focused = focused ~= nil and focused or modules.utils.is_focused()
     if
       vim.tbl_contains(
@@ -297,15 +309,20 @@ end
 ---| 'tabline'
 ---| 'winbar'
 ---@class LualineRefreshOpts
----@field kind LualineRefreshOptsKind
+---@field scope LualineRefreshOptsKind
 ---@field place LualineRefreshOptsPlace[]
----@field trigger 'autocmd'|'autocmd_redired|timer'|'unknown'
+---@field trigger 'autocmd'|'autocmd_redired'|'timer'|'unknown'
 --- Refresh contents of lualine
 ---@param opts LualineRefreshOpts
 local function refresh(opts)
   if opts == nil then
-    opts = { kind = 'tabpage', place = { 'statusline', 'winbar', 'tabline' }, trigger = 'unknown' }
+    opts = {}
   end
+  opts = vim.tbl_extend('keep', opts, {
+    scope = 'tabpage',
+    place = { 'statusline', 'winbar', 'tabline' },
+    trigger = 'unknown',
+  })
 
   -- updating statusline in autocommands context seems to trigger 100 different bugs
   -- lets just defer it to a timer context and update there
@@ -324,38 +341,83 @@ local function refresh(opts)
 
   local wins = {}
   local old_actual_curwin = vim.g.actual_curwin
-  vim.g.actual_curwin = vim.api.nvim_get_current_win()
+
+  -- ignore focus on filetypes listes in options.ignore_focus
+  local curwin = vim.api.nvim_get_current_win()
+  local curtab = vim.api.nvim_get_current_tabpage()
+  if last_focus[curtab] == nil or not vim.api.nvim_win_is_valid(last_focus[curtab]) then
+    if
+      not vim.tbl_contains(
+        config.options.ignore_focus,
+        vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(curwin), 'filetype')
+      )
+    then
+      last_focus[curtab] = curwin
+    else
+      local tab_wins = vim.api.nvim_tabpage_list_wins(curtab)
+      if #tab_wins == 1 then
+        last_focus[curtab] = curwin
+      else
+        local focusable_win = curwin
+        for _, win in ipairs(tab_wins) do
+          if
+            not vim.tbl_contains(
+              config.options.ignore_focus,
+              vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(win), 'filetype')
+            )
+          then
+            focusable_win = win
+            break
+          end
+        end
+        last_focus[curtab] = focusable_win
+      end
+    end
+  else
+    if
+      not vim.tbl_contains(
+        config.options.ignore_focus,
+        vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(curwin), 'filetype')
+      )
+    then
+      last_focus[curtab] = curwin
+    end
+  end
+  vim.g.actual_curwin = last_focus[curtab]
+
   -- gather which windows needs update
-  if opts.kind == 'all' then
+  if opts.scope == 'all' then
     if vim.tbl_contains(opts.place, 'statusline') or vim.tbl_contains(opts.place, 'winbar') then
       wins = vim.tbl_filter(function(win)
         return vim.fn.win_gettype(win) ~= 'popup'
       end, vim.api.nvim_list_wins())
     end
-  elseif opts.kind == 'tabpage' then
+  elseif opts.scope == 'tabpage' then
     if vim.tbl_contains(opts.place, 'statusline') or vim.tbl_contains(opts.place, 'winbar') then
       wins = vim.tbl_filter(function(win)
         return vim.fn.win_gettype(win) ~= 'popup'
       end, vim.api.nvim_tabpage_list_wins(0))
     end
-  elseif opts.kind == 'window' then
-    wins = { vim.api.nvim_get_current_win() }
+  elseif opts.scope == 'window' then
+    wins = { curwin }
   end
 
   -- update them
-  if vim.tbl_contains(opts.place, 'statusline') then
+  if not timers.halt_stl_refresh and vim.tbl_contains(opts.place, 'statusline') then
     for _, win in ipairs(wins) do
-      local stl_cur = vim.api.nvim_win_call(win, M.statusline)
+      refresh_real_curwin = config.options.globalstatus and last_focus[curtab] or win
+      local stl_cur = vim.api.nvim_win_call(refresh_real_curwin, M.statusline)
       local stl_last = modules.nvim_opts.get_cache('statusline', { window = win })
       if stl_cur or stl_last then
         modules.nvim_opts.set('statusline', stl_cur, { window = win })
       end
     end
   end
-  if vim.tbl_contains(opts.place, 'winbar') then
+  if not timers.halt_wb_refresh and vim.tbl_contains(opts.place, 'winbar') then
     for _, win in ipairs(wins) do
+      refresh_real_curwin = config.options.globalstatus and last_focus[curtab] or win
       if vim.api.nvim_win_get_height(win) > 1 then
-        local wbr_cur = vim.api.nvim_win_call(win, M.winbar)
+        local wbr_cur = vim.api.nvim_win_call(refresh_real_curwin, M.winbar)
         local wbr_last = modules.nvim_opts.get_cache('winbar', { window = win })
         if wbr_cur or wbr_last then
           modules.nvim_opts.set('winbar', wbr_cur, { window = win })
@@ -363,8 +425,9 @@ local function refresh(opts)
       end
     end
   end
-  if vim.tbl_contains(opts.place, 'tabline') then
-    local tbl_cur = vim.api.nvim_win_call(vim.api.nvim_get_current_win(), tabline)
+  if not timers.halt_tal_refresh and vim.tbl_contains(opts.place, 'tabline') then
+    refresh_real_curwin = curwin
+    local tbl_cur = vim.api.nvim_win_call(curwin, tabline)
     local tbl_last = modules.nvim_opts.get_cache('tabline', { global = true })
     if tbl_cur or tbl_last then
       modules.nvim_opts.set('tabline', tbl_cur, { global = true })
@@ -372,18 +435,21 @@ local function refresh(opts)
   end
 
   vim.g.actual_curwin = old_actual_curwin
+  refresh_real_curwin = nil
 end
 
 --- Sets &tabline option to lualine
-local function set_tabline()
+---@param hide boolean|nil if should hide tabline
+local function set_tabline(hide)
   vim.loop.timer_stop(timers.tal_timer)
+  timers.halt_tal_refresh = true
   vim.cmd([[augroup lualine_tal_refresh | exe "autocmd!" | augroup END]])
-  if next(config.tabline) ~= nil then
+  if not hide and next(config.tabline) ~= nil then
     vim.loop.timer_start(
       timers.tal_timer,
       0,
       config.options.refresh.tabline,
-      modules.utils.timer_call(timers.stl_timer, 'lualine_tal_refresh', function()
+      modules.utils.timer_call(timers.tal_timer, 'lualine_tal_refresh', function()
         refresh { kind = 'tabpage', place = { 'tabline' }, trigger = 'timer' }
       end, 3, 'lualine: Failed to refresh tabline')
     )
@@ -394,6 +460,7 @@ local function set_tabline()
       'lualine_tal_refresh'
     )
     modules.nvim_opts.set('showtabline', 2, { global = true })
+    timers.halt_tal_refresh = false
   else
     modules.nvim_opts.restore('tabline', { global = true })
     modules.nvim_opts.restore('showtabline', { global = true })
@@ -402,10 +469,12 @@ end
 
 --- Sets &statusline option to lualine
 --- adds auto command to redraw lualine on VimResized event
-local function set_statusline()
+---@param hide boolean|nil if should hide statusline
+local function set_statusline(hide)
   vim.loop.timer_stop(timers.stl_timer)
+  timers.halt_stl_refresh = true
   vim.cmd([[augroup lualine_stl_refresh | exe "autocmd!" | augroup END]])
-  if next(config.sections) ~= nil or next(config.inactive_sections) ~= nil then
+  if not hide and (next(config.sections) ~= nil or next(config.inactive_sections) ~= nil) then
     if vim.go.statusline == '' then
       modules.nvim_opts.set('statusline', '%#Normal#', { global = true })
     end
@@ -442,6 +511,7 @@ local function set_statusline()
         'lualine_stl_refresh'
       )
     end
+    timers.halt_stl_refresh = false
   else
     modules.nvim_opts.restore('statusline', { global = true })
     for _, win in ipairs(vim.api.nvim_list_wins()) do
@@ -452,15 +522,17 @@ local function set_statusline()
 end
 
 --- Sets &winbar option to lualine
-local function set_winbar()
+---@param hide boolean|nil if should unset winbar
+local function set_winbar(hide)
   vim.loop.timer_stop(timers.wb_timer)
+  timers.halt_wb_refresh = true
   vim.cmd([[augroup lualine_wb_refresh | exe "autocmd!" | augroup END]])
-  if next(config.winbar) ~= nil or next(config.inactive_winbar) ~= nil then
+  if not hide and (next(config.winbar) ~= nil or next(config.inactive_winbar) ~= nil) then
     vim.loop.timer_start(
-      timers.stl_timer,
+      timers.wb_timer,
       0,
       config.options.refresh.winbar,
-      modules.utils.timer_call(timers.stl_timer, 'lualine_wb_refresh', function()
+      modules.utils.timer_call(timers.wb_timer, 'lualine_wb_refresh', function()
         refresh { kind = 'tabpage', place = { 'winbar' }, trigger = 'timer' }
       end, 3, 'lualine: Failed to refresh winbar')
     )
@@ -470,10 +542,39 @@ local function set_winbar()
       "call v:lua.require'lualine'.refresh({'kind': 'tabpage', 'place': ['winbar'], 'trigger': 'autocmd'})",
       'lualine_wb_refresh'
     )
+    timers.halt_wb_refresh = false
   elseif vim.fn.has('nvim-0.8') == 1 then
     modules.nvim_opts.restore('winbar', { global = true })
     for _, win in ipairs(vim.api.nvim_list_wins()) do
       modules.nvim_opts.restore('winbar', { window = win })
+    end
+  end
+end
+
+---@alias LualineHideOptsPlace
+---| 'statusline'
+---| 'tabline'
+---| 'winbar'
+---@class LualineHideOpts
+---@field place LualineHideOptsPlace[]
+---@field unhide boolean
+---@param opts LualineHideOpts
+local function hide(opts)
+  if opts == nil then
+    opts = {}
+  end
+  opts = vim.tbl_extend('keep', opts, {
+    place = { 'statusline', 'tabline', 'winbar' },
+    unhide = false,
+  })
+  local hide_fn = {
+    statusline = set_statusline,
+    tabline = set_tabline,
+    winbar = set_winbar,
+  }
+  for _, place in ipairs(opts.place) do
+    if hide_fn[place] then
+      hide_fn[place](not opts.unhide)
     end
   end
 end
@@ -512,6 +613,7 @@ M = {
   get_config = modules.config_module.get_config,
   refresh = refresh,
   winbar = status_dispatch('winbar'),
+  hide = hide,
 }
 
 return M
