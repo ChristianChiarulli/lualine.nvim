@@ -593,6 +593,7 @@ sections = {
     {
       'filename',
       file_status = true,      -- Displays file status (readonly status, modified status)
+      newfile_status = false   -- Display new file status (new file means no write after created)
       path = 0,                -- 0: Just the filename
                                -- 1: Relative path
                                -- 2: Absolute path
@@ -604,6 +605,7 @@ sections = {
         modified = '[+]',      -- Text to show when the file is modified.
         readonly = '[-]',      -- Text to show when the file is non-modifiable or readonly.
         unnamed = '[No Name]', -- Text to show for unnamed buffers.
+        newfile = '[New]',     -- Text to show for new created file before first writting
       }
     }
   }
@@ -757,10 +759,14 @@ Shows currently open buffers. Like bufferline . See
 for all builtin behaviors of buffers component.
 You can use `:LualineBuffersJump` to jump to buffer based on index
 of buffer in buffers component.
+Jumping to non-existent buffer indices generates an error. To avoid these errors
+`LualineBuffersJump` provides `<bang>` support, meaning that you can call
+`:LualineBufferJump!` to ignore these errors.
 
 ```vim
   :LualineBuffersJump 2  " Jumps to 2nd buffer in buffers component.
   :LualineBuffersJump $  " Jumps to last buffer in buffers component.
+  :LualineBuffersJump! 3  " Attempts to jump to 3rd buffer, if it exists.
 ```
 
 #### Tabs

@@ -26,7 +26,7 @@ local last_focus = {}
 local refresh_real_curwin
 
 -- The events on which lualine redraws itself
-local default_refresh_events = 'WinEnter,BufEnter,SessionLoadPost,FileChangedShellPost,VimResized,Filetype'
+local default_refresh_events = 'WinEnter,BufEnter,SessionLoadPost,FileChangedShellPost,VimResized,Filetype,CursorMoved'
 if vim.fn.has('nvim-0.7') == 1 then -- utilize ModeChanged event introduced in 0.7
   default_refresh_events = default_refresh_events .. ',ModeChanged'
 end
@@ -326,16 +326,21 @@ local function refresh(opts)
 
   -- updating statusline in autocommands context seems to trigger 100 different bugs
   -- lets just defer it to a timer context and update there
-  -- workaround for https://github.com/neovim/neovim/issues/15300
-  -- workaround for https://github.com/neovim/neovim/issues/19464
-  -- workaround for https://github.com/nvim-lualine/lualine.nvim/issues/753
-  -- workaround for https://github.com/nvim-lualine/lualine.nvim/issues/751
-  -- workaround for https://github.com/nvim-lualine/lualine.nvim/issues/755
-  if opts.trigger == 'autocmd' then
+  -- Since updating stl in command mode doesn't take effect
+  -- refresh ModeChanged command in autocmd context as exception.
+  -- workaround for
+  --   https://github.com/neovim/neovim/issues/15300
+  --   https://github.com/neovim/neovim/issues/19464
+  --   https://github.com/nvim-lualine/lualine.nvim/issues/753
+  --   https://github.com/nvim-lualine/lualine.nvim/issues/751
+  --   https://github.com/nvim-lualine/lualine.nvim/issues/755
+  --   https://github.com/neovim/neovim/issues/19472
+  --   https://github.com/nvim-lualine/lualine.nvim/issues/791
+  if opts.trigger == 'autocmd' and vim.v.event.new_mode ~= 'c' then
     opts.trigger = 'autocmd_redired'
-    vim.defer_fn(function()
+    vim.schedule(function()
       M.refresh(opts)
-    end, 50)
+    end)
     return
   end
 
@@ -406,16 +411,20 @@ local function refresh(opts)
   if not timers.halt_stl_refresh and vim.tbl_contains(opts.place, 'statusline') then
     for _, win in ipairs(wins) do
       refresh_real_curwin = config.options.globalstatus and last_focus[curtab] or win
+      local set_win = config.options.globalstatus
+          and vim.fn.win_gettype(refresh_real_curwin) == 'popup'
+          and refresh_real_curwin
+        or win
       local stl_cur = vim.api.nvim_win_call(refresh_real_curwin, M.statusline)
-      local stl_last = modules.nvim_opts.get_cache('statusline', { window = win })
+      local stl_last = modules.nvim_opts.get_cache('statusline', { window = set_win })
       if stl_cur or stl_last then
-        modules.nvim_opts.set('statusline', stl_cur, { window = win })
+        modules.nvim_opts.set('statusline', stl_cur, { window = set_win })
       end
     end
   end
   if not timers.halt_wb_refresh and vim.tbl_contains(opts.place, 'winbar') then
     for _, win in ipairs(wins) do
-      refresh_real_curwin = config.options.globalstatus and last_focus[curtab] or win
+      refresh_real_curwin = win
       if vim.api.nvim_win_get_height(win) > 1 then
         local wbr_cur = vim.api.nvim_win_call(refresh_real_curwin, M.winbar)
         local wbr_last = modules.nvim_opts.get_cache('winbar', { window = win })
